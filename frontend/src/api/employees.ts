@@ -25,6 +25,8 @@ export interface Employee {
   emergency_contact_phone?: string | null;
   emergency_contact_relation?: string | null;
   bank_name?: string | null;
+  account_number?: string | null;
+  ifsc_code?: string | null;
   bank_account_number?: string | null;
   bank_ifsc_code?: string | null;
   pan_number?: string | null;
@@ -53,6 +55,8 @@ export interface EmployeePayload {
   emergency_contact_phone?: string | null;
   emergency_contact_relation?: string | null;
   bank_name?: string | null;
+  account_number?: string | null;
+  ifsc_code?: string | null;
   bank_account_number?: string | null;
   bank_ifsc_code?: string | null;
   pan_number?: string | null;

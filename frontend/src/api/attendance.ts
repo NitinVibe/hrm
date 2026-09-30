@@ -15,6 +15,44 @@ export interface Attendance {
   updated_at: string;
 }
 
+export interface ShiftBrief {
+  id: string;
+  name: string;
+  start_time: string;
+  end_time: string;
+  grace_minutes: number;
+}
+
+export interface EmployeeBrief {
+  id: string;
+  employee_code: string;
+  first_name: string;
+  last_name: string | null;
+}
+
+export interface AttendanceTodayItem {
+  id: string;
+  attendance_date: string;
+  check_in: string | null;
+  check_out: string | null;
+  status: string;
+  late_minutes: number;
+  working_minutes: number;
+  notes: string | null;
+}
+
+export interface AttendanceTodayStatus {
+  date: string;
+  has_employee_profile: boolean;
+  employee: EmployeeBrief | null;
+  has_shift: boolean;
+  shift: ShiftBrief | null;
+  is_on_leave: boolean;
+  leave_reason: string | null;
+  state: "NO_PROFILE" | "NOT_CHECKED_IN" | "CHECKED_IN" | "LATE" | "CHECKED_OUT" | "ON_LEAVE";
+  attendance: AttendanceTodayItem | null;
+}
+
 export interface AttendanceRegularization {
   id: string;
   organization_id: string;
@@ -53,6 +91,16 @@ export async function myCheckIn(): Promise<Attendance> {
 
 export async function myCheckOut(): Promise<Attendance> {
   const response = await api.post<Attendance>("/attendance/me/check-out");
+  return response.data;
+}
+
+export async function getMyTodayStatus(): Promise<AttendanceTodayStatus> {
+  const response = await api.get<AttendanceTodayStatus>("/attendance/me/today-status");
+  return response.data;
+}
+
+export async function getEmployeeTodayStatus(employeeId: string): Promise<AttendanceTodayStatus> {
+  const response = await api.get<AttendanceTodayStatus>(`/attendance/employee/${employeeId}/today-status`);
   return response.data;
 }
 

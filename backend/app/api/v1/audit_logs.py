@@ -29,3 +29,4 @@ def list_audit_logs(
 
     query = query.order_by(AuditLog.created_at.desc()).offset(offset).limit(limit)
     return db.scalars(query).all()
+

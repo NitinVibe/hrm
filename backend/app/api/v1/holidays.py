@@ -85,3 +85,4 @@ def delete_holiday(
     db.delete(h)
     db.commit()
     return None
+

@@ -24,3 +24,4 @@ class AttendanceRegularization(Base):
     organization = relationship("Organization")
     employee = relationship("Employee")
     reviewed_by = relationship("User")
+

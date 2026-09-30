@@ -233,3 +233,4 @@ def allocate_leave_balance(
     db.commit()
     db.refresh(bal)
     return bal
+

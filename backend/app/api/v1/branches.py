@@ -151,3 +151,4 @@ def delete_branch(
     )
     db.commit()
     return None
+

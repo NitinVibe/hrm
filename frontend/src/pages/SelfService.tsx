@@ -15,15 +15,21 @@ import {
   X,
   ChevronRight,
   Briefcase,
+  AlertCircle,
+  FileText,
+  Timer,
+  ShieldCheck,
 } from "lucide-react";
 import { getUserProfile, type UserProfile } from "../api/auth";
 import {
   myCheckIn,
   myCheckOut,
+  getMyTodayStatus,
   getAttendance,
   requestRegularization,
   getRegularizations,
   type Attendance,
+  type AttendanceTodayStatus,
   type AttendanceRegularization,
 } from "../api/attendance";
 import {
@@ -39,17 +45,43 @@ import { getPayslips, type Payslip } from "../api/payroll";
 import { getGoals, updateGoal, type Goal } from "../api/performance";
 import { getAnnouncements, type Announcement } from "../api/announcements";
 import { getEmployees, type Employee } from "../api/employees";
+import {
+  submitResignation,
+  getResignations,
+  type Resignation,
+} from "../api/resignations";
+
+function formatMinutes(minutes: number) {
+  if (!minutes || minutes <= 0) return "0m";
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  if (h === 0) return `${m}m`;
+  return `${h}h ${m}m`;
+}
+
+function formatTime(isoString: string | null | undefined) {
+  if (!isoString) return "—";
+  try {
+    return new Date(isoString).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  } catch {
+    return isoString;
+  }
+}
 
 export default function SelfService() {
-  const [activeTab, setActiveTab] = useState<"overview" | "attendance" | "leaves" | "payroll" | "goals">("overview");
+  const [activeTab, setActiveTab] = useState<
+    "overview" | "attendance" | "leaves" | "payroll" | "goals" | "resignation"
+  >("overview");
   const [_loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
 
-  // Profile
+  // Profile & Employee info
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [employeeDetails, setEmployeeDetails] = useState<Employee | null>(null);
 
   // States
-  const [todayAttendance, setTodayAttendance] = useState<Attendance | null>(null);
+  const [todayStatus, setTodayStatus] = useState<AttendanceTodayStatus | null>(null);
   const [attendanceHistory, setAttendanceHistory] = useState<Attendance[]>([]);
   const [regularizations, setRegularizations] = useState<AttendanceRegularization[]>([]);
   const [leaveBalances, setLeaveBalances] = useState<LeaveBalance[]>([]);
@@ -58,10 +90,15 @@ export default function SelfService() {
   const [myPayslips, setMyPayslips] = useState<Payslip[]>([]);
   const [myGoals, setMyGoals] = useState<Goal[]>([]);
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
+  const [myResignations, setMyResignations] = useState<Resignation[]>([]);
+
+  // Live timer
+  const [liveWorkingMinutes, setLiveWorkingMinutes] = useState<number>(0);
 
   // Modals
   const [showLeaveModal, setShowLeaveModal] = useState(false);
   const [showRegModal, setShowRegModal] = useState(false);
+  const [showResignModal, setShowResignModal] = useState(false);
   const [selectedPayslip, setSelectedPayslip] = useState<Payslip | null>(null);
 
   // Forms
@@ -82,6 +119,16 @@ export default function SelfService() {
     reason: "",
   });
 
+  const [resignForm, setResignForm] = useState({
+    reason: "",
+    proposed_last_working_day: new Date(Date.now() + 30 * 86400000).toISOString().split("T")[0],
+  });
+
+  const showToast = (message: string, type: "success" | "error" = "success") => {
+    setToast({ message, type });
+    setTimeout(() => setToast(null), 4000);
+  };
+
   const fetchProfileAndData = async () => {
     setLoading(true);
     try {
@@ -89,15 +136,18 @@ export default function SelfService() {
       setProfile(prof);
 
       const empId = prof.employee?.id;
-      const today = new Date().toISOString().split("T")[0];
 
-      const [types, ann, allEmployees] = await Promise.all([
+      const [types, ann, allEmployees, todayStat, resignList] = await Promise.all([
         getLeaveTypes(),
         getAnnouncements(),
         getEmployees(),
+        getMyTodayStatus().catch(() => null),
+        getResignations().catch(() => []),
       ]);
+
       setLeaveTypes(types);
       setAnnouncements(ann);
+      if (todayStat) setTodayStatus(todayStat);
 
       if (empId) {
         const fullEmp = allEmployees.find((e) => e.id === empId);
@@ -113,14 +163,12 @@ export default function SelfService() {
         ]);
 
         setAttendanceHistory(attList);
-        const todayAtt = attList.find((a) => a.attendance_date === today);
-        setTodayAttendance(todayAtt || null);
-
         setRegularizations(regs.filter((r) => r.employee_id === empId));
         setLeaveBalances(balances);
         setMyLeaves(leaves.filter((l) => l.employee_id === empId));
         setMyPayslips(payslips);
         setMyGoals(goals);
+        setMyResignations(resignList.filter((r) => r.employee_id === empId));
       }
     } catch (err) {
       console.error("Failed to load ESS data", err);
@@ -133,32 +181,88 @@ export default function SelfService() {
     fetchProfileAndData();
   }, []);
 
-  // Quick Check In / Check Out
+  // Live timer for ongoing working time
+  useEffect(() => {
+    if (!todayStatus?.attendance?.check_in || todayStatus.attendance.check_out) {
+      if (todayStatus?.attendance?.working_minutes) {
+        setLiveWorkingMinutes(todayStatus.attendance.working_minutes);
+      }
+      return;
+    }
+
+    const calculate = () => {
+      const checkInTime = new Date(todayStatus.attendance!.check_in!).getTime();
+      const now = Date.now();
+      const mins = Math.max(0, Math.floor((now - checkInTime) / 60000));
+      setLiveWorkingMinutes(mins);
+    };
+
+    calculate();
+    const interval = setInterval(calculate, 30000);
+    return () => clearInterval(interval);
+  }, [todayStatus]);
+
+  // Quick Check In / Check Out with state machine
   const handleCheckIn = async () => {
+    setBusy(true);
     try {
-      await myCheckIn();
-      alert("Checked in successfully!");
-      fetchProfileAndData();
+      const res = await myCheckIn();
+      const nowStr = new Date(res.check_in || Date.now()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      showToast(`Checked in successfully at ${nowStr}!`);
+      const updatedStatus = await getMyTodayStatus();
+      setTodayStatus(updatedStatus);
+      if (profile?.employee?.id) {
+        const attList = await getAttendance({ employee_id: profile.employee.id });
+        setAttendanceHistory(attList);
+      }
     } catch (err: any) {
-      alert(err.response?.data?.detail || "Check in failed.");
+      showToast(err.response?.data?.detail || "Check in failed.", "error");
+    } finally {
+      setBusy(false);
     }
   };
 
-  const handleCheckOut = async () => {
+  const performCheckOut = async () => {
+    setBusy(true);
     try {
-      await myCheckOut();
-      alert("Checked out successfully!");
-      fetchProfileAndData();
+      const res = await myCheckOut();
+      const outStr = new Date(res.check_out || Date.now()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      showToast(`Checked out successfully at ${outStr}!`);
+      const updatedStatus = await getMyTodayStatus();
+      setTodayStatus(updatedStatus);
+      if (profile?.employee?.id) {
+        const attList = await getAttendance({ employee_id: profile.employee.id });
+        setAttendanceHistory(attList);
+      }
     } catch (err: any) {
-      alert(err.response?.data?.detail || "Check out failed.");
+      showToast(err.response?.data?.detail || "Check out failed.", "error");
+    } finally {
+      setBusy(false);
     }
+  };
+
+  const handleCheckOutClick = async () => {
+    if (todayStatus?.shift?.end_time) {
+      const [endH, endM] = todayStatus.shift.end_time.split(":").map(Number);
+      const now = new Date();
+      const shiftEnd = new Date();
+      shiftEnd.setHours(endH, endM, 0, 0);
+
+      if (now < shiftEnd) {
+        const proceed = window.confirm(
+          `Your shift ends at ${todayStatus.shift.end_time.slice(0, 5)}. Checking out now is an early departure. Do you want to proceed?`
+        );
+        if (!proceed) return;
+      }
+    }
+    await performCheckOut();
   };
 
   // Submit Leave
   const handleApplyLeave = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!profile?.employee?.id) {
-      alert("No employee profile found.");
+      showToast("No employee profile found.", "error");
       return;
     }
     try {
@@ -173,10 +277,21 @@ export default function SelfService() {
         reason: leaveForm.reason,
       });
       setShowLeaveModal(false);
-      alert("Leave application submitted for approval!");
-      fetchProfileAndData();
+      showToast("Leave application submitted for approval!");
+      // Reset form
+      setLeaveForm({
+        ...leaveForm,
+        reason: "",
+      });
+      // Refetch
+      const [balances, leaves] = await Promise.all([
+        getEmployeeLeaveBalances(profile.employee.id),
+        getLeaves(),
+      ]);
+      setLeaveBalances(balances);
+      setMyLeaves(leaves.filter((l) => l.employee_id === profile.employee!.id));
     } catch (err: any) {
-      alert(err.response?.data?.detail || "Failed to submit leave application.");
+      showToast(err.response?.data?.detail || "Failed to submit leave application.", "error");
     }
   };
 
@@ -191,10 +306,34 @@ export default function SelfService() {
         reason: regForm.reason,
       });
       setShowRegModal(false);
-      alert("Regularization request submitted!");
-      fetchProfileAndData();
+      showToast("Regularization request submitted!");
+      setRegForm({ ...regForm, reason: "" });
+      const regs = await getRegularizations();
+      if (profile?.employee?.id) {
+        setRegularizations(regs.filter((r) => r.employee_id === profile.employee!.id));
+      }
     } catch (err: any) {
-      alert(err.response?.data?.detail || "Failed to submit regularization.");
+      showToast(err.response?.data?.detail || "Failed to submit regularization.", "error");
+    }
+  };
+
+  // Submit Resignation
+  const handleApplyResign = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      await submitResignation({
+        reason: resignForm.reason,
+        proposed_last_working_day: resignForm.proposed_last_working_day,
+      });
+      setShowResignModal(false);
+      showToast("Resignation letter formally submitted!");
+      setResignForm({ reason: "", proposed_last_working_day: "" });
+      const resignList = await getResignations();
+      if (profile?.employee?.id) {
+        setMyResignations(resignList.filter((r) => r.employee_id === profile.employee!.id));
+      }
+    } catch (err: any) {
+      showToast(err.response?.data?.detail || "Failed to submit resignation.", "error");
     }
   };
 
@@ -205,14 +344,36 @@ export default function SelfService() {
         progress_percentage: val,
         status: val >= 100 ? "achieved" : val > 0 ? "in_progress" : "not_started",
       });
-      fetchProfileAndData();
+      showToast(`Goal progress updated to ${val}%!`);
+      if (profile?.employee?.id) {
+        const goals = await getGoals({ employee_id: profile.employee.id });
+        setMyGoals(goals);
+      }
     } catch (err: any) {
-      alert("Failed to update goal.");
+      showToast("Failed to update goal.", "error");
     }
   };
 
   return (
     <div className="space-y-6">
+      {/* Toast Notification */}
+      {toast && (
+        <div
+          className={`fixed bottom-6 right-6 z-50 flex items-center gap-3 rounded-xl px-5 py-3.5 shadow-2xl transition-all ${
+            toast.type === "success"
+              ? "bg-slate-900 text-white border border-emerald-500/30"
+              : "bg-rose-900 text-white border border-rose-500/30"
+          }`}
+        >
+          {toast.type === "success" ? (
+            <CheckCircle2 className="h-5 w-5 text-emerald-400" />
+          ) : (
+            <AlertCircle className="h-5 w-5 text-rose-400" />
+          )}
+          <span className="text-sm font-medium">{toast.message}</span>
+        </div>
+      )}
+
       {/* Top Banner */}
       <div className="bg-gradient-to-r from-indigo-700 via-indigo-800 to-slate-900 rounded-2xl p-6 text-white shadow-lg flex flex-col md:flex-row md:items-center justify-between gap-6">
         <div className="flex items-center gap-4">
@@ -230,10 +391,13 @@ export default function SelfService() {
                 {profile?.user.role || "Employee"}
               </span>
             </div>
-            <p className="text-xs text-indigo-200 mt-1 flex items-center gap-3">
-              <span>Code: <strong>{profile?.employee?.employee_code || "N/A"}</strong></span>
+            <p className="text-xs text-indigo-200 mt-1 flex flex-wrap items-center gap-3">
+              <span>Code: <strong>{profile?.employee?.employee_code || "—"}</strong></span>
               <span>Organization: <strong>{profile?.organization?.name || "Enterprise"}</strong></span>
               <span>Status: <strong className="capitalize">{profile?.employee?.employment_status || "Active"}</strong></span>
+              {todayStatus?.shift && (
+                <span>Shift: <strong>{todayStatus.shift.name} ({todayStatus.shift.start_time.slice(0, 5)} - {todayStatus.shift.end_time.slice(0, 5)})</strong></span>
+              )}
             </p>
           </div>
         </div>
@@ -241,33 +405,51 @@ export default function SelfService() {
         {/* Quick Punch Widget */}
         <div className="bg-white/10 backdrop-blur-md border border-white/20 rounded-xl p-4 flex items-center gap-4">
           <div>
-            <p className="text-xs text-indigo-200 font-medium">Today's Attendance</p>
+            <p className="text-xs text-indigo-200 font-medium flex items-center gap-1">
+              <Clock className="w-3.5 h-3.5" /> Today's Punch
+            </p>
             <p className="text-sm font-bold mt-0.5">
-              {todayAttendance?.check_in
-                ? `In: ${new Date(todayAttendance.check_in).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
-                : "Not Checked In"}
+              {todayStatus?.state === "ON_LEAVE" ? (
+                <span className="text-rose-300">On Leave</span>
+              ) : todayStatus?.state === "CHECKED_OUT" ? (
+                <span className="text-blue-300">Out: {formatTime(todayStatus.attendance?.check_out)}</span>
+              ) : todayStatus?.state === "CHECKED_IN" || todayStatus?.state === "LATE" ? (
+                <span className="text-emerald-300">In: {formatTime(todayStatus.attendance?.check_in)} ({formatMinutes(liveWorkingMinutes)})</span>
+              ) : (
+                <span className="text-slate-300">Not Checked In</span>
+              )}
             </p>
           </div>
 
           <div className="flex items-center gap-2">
-            {!todayAttendance?.check_in ? (
+            {todayStatus?.state === "ON_LEAVE" ? (
+              <span className="px-3 py-1.5 bg-rose-500/20 text-rose-200 text-xs font-bold rounded-lg border border-rose-400/30">
+                On Leave
+              </span>
+            ) : !todayStatus?.has_shift ? (
+              <span className="px-3 py-1.5 bg-slate-700/50 text-slate-300 text-xs font-medium rounded-lg">
+                No Shift
+              </span>
+            ) : todayStatus?.state === "NOT_CHECKED_IN" ? (
               <button
+                disabled={busy}
                 onClick={handleCheckIn}
-                className="flex items-center gap-1.5 px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-bold rounded-lg shadow transition-colors"
+                className="flex items-center gap-1.5 px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-bold rounded-lg shadow transition-colors active:scale-95 disabled:opacity-50"
               >
                 <LogIn className="w-4 h-4" />
                 Check In
               </button>
-            ) : !todayAttendance?.check_out ? (
+            ) : todayStatus?.state === "CHECKED_IN" || todayStatus?.state === "LATE" ? (
               <button
-                onClick={handleCheckOut}
-                className="flex items-center gap-1.5 px-4 py-2 bg-rose-500 hover:bg-rose-600 text-white text-xs font-bold rounded-lg shadow transition-colors"
+                disabled={busy}
+                onClick={handleCheckOutClick}
+                className="flex items-center gap-1.5 px-4 py-2 bg-rose-500 hover:bg-rose-600 text-white text-xs font-bold rounded-lg shadow transition-colors active:scale-95 disabled:opacity-50"
               >
                 <LogOut className="w-4 h-4" />
                 Check Out
               </button>
             ) : (
-              <span className="px-3 py-1.5 bg-emerald-500/20 text-emerald-200 text-xs font-bold rounded-lg border border-emerald-400/30 flex items-center gap-1">
+              <span className="px-3 py-1.5 bg-blue-500/20 text-blue-200 text-xs font-bold rounded-lg border border-blue-400/30 flex items-center gap-1">
                 <CheckCircle2 className="w-4 h-4" /> Completed
               </span>
             )}
@@ -276,10 +458,10 @@ export default function SelfService() {
       </div>
 
       {/* Tabs */}
-      <div className="flex border-b border-slate-200 gap-6">
+      <div className="flex border-b border-slate-200 gap-6 overflow-x-auto">
         <button
           onClick={() => setActiveTab("overview")}
-          className={`pb-3 text-sm font-semibold border-b-2 flex items-center gap-2 transition-colors ${
+          className={`pb-3 text-sm font-semibold border-b-2 flex items-center gap-2 whitespace-nowrap transition-colors ${
             activeTab === "overview"
               ? "border-indigo-600 text-indigo-600"
               : "border-transparent text-slate-500 hover:text-slate-800"
@@ -290,7 +472,7 @@ export default function SelfService() {
         </button>
         <button
           onClick={() => setActiveTab("attendance")}
-          className={`pb-3 text-sm font-semibold border-b-2 flex items-center gap-2 transition-colors ${
+          className={`pb-3 text-sm font-semibold border-b-2 flex items-center gap-2 whitespace-nowrap transition-colors ${
             activeTab === "attendance"
               ? "border-indigo-600 text-indigo-600"
               : "border-transparent text-slate-500 hover:text-slate-800"
@@ -301,7 +483,7 @@ export default function SelfService() {
         </button>
         <button
           onClick={() => setActiveTab("leaves")}
-          className={`pb-3 text-sm font-semibold border-b-2 flex items-center gap-2 transition-colors ${
+          className={`pb-3 text-sm font-semibold border-b-2 flex items-center gap-2 whitespace-nowrap transition-colors ${
             activeTab === "leaves"
               ? "border-indigo-600 text-indigo-600"
               : "border-transparent text-slate-500 hover:text-slate-800"
@@ -312,7 +494,7 @@ export default function SelfService() {
         </button>
         <button
           onClick={() => setActiveTab("payroll")}
-          className={`pb-3 text-sm font-semibold border-b-2 flex items-center gap-2 transition-colors ${
+          className={`pb-3 text-sm font-semibold border-b-2 flex items-center gap-2 whitespace-nowrap transition-colors ${
             activeTab === "payroll"
               ? "border-indigo-600 text-indigo-600"
               : "border-transparent text-slate-500 hover:text-slate-800"
@@ -323,7 +505,7 @@ export default function SelfService() {
         </button>
         <button
           onClick={() => setActiveTab("goals")}
-          className={`pb-3 text-sm font-semibold border-b-2 flex items-center gap-2 transition-colors ${
+          className={`pb-3 text-sm font-semibold border-b-2 flex items-center gap-2 whitespace-nowrap transition-colors ${
             activeTab === "goals"
               ? "border-indigo-600 text-indigo-600"
               : "border-transparent text-slate-500 hover:text-slate-800"
@@ -331,6 +513,17 @@ export default function SelfService() {
         >
           <Target className="w-4 h-4" />
           My OKRs & Goals ({myGoals.length})
+        </button>
+        <button
+          onClick={() => setActiveTab("resignation")}
+          className={`pb-3 text-sm font-semibold border-b-2 flex items-center gap-2 whitespace-nowrap transition-colors ${
+            activeTab === "resignation"
+              ? "border-indigo-600 text-indigo-600"
+              : "border-transparent text-slate-500 hover:text-slate-800"
+          }`}
+        >
+          <ShieldCheck className="w-4 h-4" />
+          Resignation & Exit Clearance ({myResignations.length})
         </button>
       </div>
 
@@ -347,15 +540,15 @@ export default function SelfService() {
               <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 pt-4 text-xs">
                 <div>
                   <span className="text-slate-400 block">Employee Code</span>
-                  <span className="font-bold text-slate-800 text-sm mt-0.5">{profile?.employee?.employee_code || "N/A"}</span>
+                  <span className="font-bold text-slate-800 text-sm mt-0.5">{profile?.employee?.employee_code || "—"}</span>
                 </div>
                 <div>
                   <span className="text-slate-400 block">Employment Type</span>
-                  <span className="font-bold text-slate-800 text-sm capitalize mt-0.5">{employeeDetails?.employment_type || "Full Time"}</span>
+                  <span className="font-bold text-slate-800 text-sm capitalize mt-0.5">{employeeDetails?.employment_type || "—"}</span>
                 </div>
                 <div>
                   <span className="text-slate-400 block">Joining Date</span>
-                  <span className="font-bold text-slate-800 text-sm mt-0.5">{profile?.employee?.joining_date || "2026-01-15"}</span>
+                  <span className="font-bold text-slate-800 text-sm mt-0.5">{profile?.employee?.joining_date || "—"}</span>
                 </div>
                 <div>
                   <span className="text-slate-400 block">Work Email</span>
@@ -363,11 +556,11 @@ export default function SelfService() {
                 </div>
                 <div>
                   <span className="text-slate-400 block">Phone</span>
-                  <span className="font-bold text-slate-800 text-sm mt-0.5">{profile?.employee?.phone || "+1 (555) 000-0000"}</span>
+                  <span className="font-bold text-slate-800 text-sm mt-0.5">{profile?.employee?.phone || employeeDetails?.phone || "—"}</span>
                 </div>
                 <div>
                   <span className="text-slate-400 block">Blood Group</span>
-                  <span className="font-bold text-slate-800 text-sm mt-0.5">{employeeDetails?.blood_group || "O+"}</span>
+                  <span className="font-bold text-slate-800 text-sm mt-0.5">{employeeDetails?.blood_group || "—"}</span>
                 </div>
               </div>
             </div>
@@ -381,23 +574,23 @@ export default function SelfService() {
               <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 pt-4 text-xs">
                 <div>
                   <span className="text-slate-400 block">Bank Name</span>
-                  <span className="font-bold text-slate-800 text-sm mt-0.5">{employeeDetails?.bank_name || "HDFC Bank"}</span>
+                  <span className="font-bold text-slate-800 text-sm mt-0.5">{employeeDetails?.bank_name || "—"}</span>
                 </div>
                 <div>
                   <span className="text-slate-400 block">Account Number</span>
-                  <span className="font-bold text-slate-800 text-sm mt-0.5 font-mono">{employeeDetails?.bank_account_number || "••••••••5678"}</span>
+                  <span className="font-bold text-slate-800 text-sm mt-0.5 font-mono">{employeeDetails?.account_number || employeeDetails?.bank_account_number || "—"}</span>
                 </div>
                 <div>
                   <span className="text-slate-400 block">IFSC / Routing</span>
-                  <span className="font-bold text-slate-800 text-sm mt-0.5 font-mono">{employeeDetails?.bank_ifsc_code || "HDFC0001234"}</span>
+                  <span className="font-bold text-slate-800 text-sm mt-0.5 font-mono">{employeeDetails?.ifsc_code || employeeDetails?.bank_ifsc_code || "—"}</span>
                 </div>
                 <div>
                   <span className="text-slate-400 block">PAN Identification</span>
-                  <span className="font-bold text-slate-800 text-sm mt-0.5 font-mono">{employeeDetails?.pan_number || "ABCDE1234F"}</span>
+                  <span className="font-bold text-slate-800 text-sm mt-0.5 font-mono">{employeeDetails?.pan_number || "—"}</span>
                 </div>
                 <div>
                   <span className="text-slate-400 block">Aadhaar / National ID</span>
-                  <span className="font-bold text-slate-800 text-sm mt-0.5 font-mono">{employeeDetails?.aadhar_number || "•••• •••• 9012"}</span>
+                  <span className="font-bold text-slate-800 text-sm mt-0.5 font-mono">{employeeDetails?.aadhar_number || "—"}</span>
                 </div>
               </div>
             </div>
@@ -411,15 +604,15 @@ export default function SelfService() {
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-4 text-xs">
                 <div>
                   <span className="text-slate-400 block">Contact Name</span>
-                  <span className="font-bold text-slate-800 text-sm mt-0.5">{employeeDetails?.emergency_contact_name || "Family Contact"}</span>
+                  <span className="font-bold text-slate-800 text-sm mt-0.5">{employeeDetails?.emergency_contact_name || "—"}</span>
                 </div>
                 <div>
                   <span className="text-slate-400 block">Relationship</span>
-                  <span className="font-bold text-slate-800 text-sm mt-0.5">{employeeDetails?.emergency_contact_relation || "Spouse / Parent"}</span>
+                  <span className="font-bold text-slate-800 text-sm mt-0.5">{employeeDetails?.emergency_contact_relation || "—"}</span>
                 </div>
                 <div>
                   <span className="text-slate-400 block">Emergency Phone</span>
-                  <span className="font-bold text-slate-800 text-sm mt-0.5">{employeeDetails?.emergency_contact_phone || "+1 (555) 999-8888"}</span>
+                  <span className="font-bold text-slate-800 text-sm mt-0.5">{employeeDetails?.emergency_contact_phone || "—"}</span>
                 </div>
               </div>
             </div>
@@ -453,16 +646,16 @@ export default function SelfService() {
               </div>
             </div>
 
-            {/* Quick Actions */}
-            <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-5 space-y-2">
-              <h3 className="text-sm font-bold text-slate-900 pb-2 border-b border-slate-100">Quick Actions</h3>
+            {/* Quick Actions Card */}
+            <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-5 space-y-3">
+              <h3 className="text-sm font-bold text-slate-900 pb-2 border-b border-slate-100">Quick Access</h3>
               <button
                 onClick={() => setShowLeaveModal(true)}
                 className="w-full flex items-center justify-between p-2.5 hover:bg-slate-50 rounded-lg text-xs font-semibold text-slate-700 transition-colors"
               >
                 <span className="flex items-center gap-2">
                   <Calendar className="w-4 h-4 text-indigo-600" />
-                  Apply for Leave
+                  Request Time Off
                 </span>
                 <ChevronRight className="w-4 h-4 text-slate-400" />
               </button>
@@ -476,6 +669,16 @@ export default function SelfService() {
                 </span>
                 <ChevronRight className="w-4 h-4 text-slate-400" />
               </button>
+              <button
+                onClick={() => setShowResignModal(true)}
+                className="w-full flex items-center justify-between p-2.5 hover:bg-slate-50 rounded-lg text-xs font-semibold text-slate-700 transition-colors"
+              >
+                <span className="flex items-center gap-2">
+                  <FileText className="w-4 h-4 text-rose-600" />
+                  Submit Resignation
+                </span>
+                <ChevronRight className="w-4 h-4 text-slate-400" />
+              </button>
             </div>
           </div>
         </div>
@@ -484,6 +687,104 @@ export default function SelfService() {
       {/* TAB 2: ATTENDANCE & REGULARIZATION */}
       {activeTab === "attendance" && (
         <div className="space-y-6">
+          {/* Prominent Today Punch Terminal */}
+          <div className="rounded-2xl border border-indigo-100 bg-gradient-to-br from-indigo-950 via-slate-900 to-slate-900 p-6 text-white shadow-xl relative overflow-hidden">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6 relative z-10">
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs uppercase font-semibold text-indigo-300 flex items-center gap-1.5">
+                    <Clock className="w-3.5 h-3.5" />
+                    Today's Attendance Status
+                  </span>
+                  {todayStatus?.state === "ON_LEAVE" ? (
+                    <span className="px-2.5 py-0.5 rounded-full bg-rose-500/20 text-rose-300 text-xs font-bold border border-rose-500/30">
+                      On Approved Leave
+                    </span>
+                  ) : todayStatus?.state === "CHECKED_OUT" ? (
+                    <span className="px-2.5 py-0.5 rounded-full bg-blue-500/20 text-blue-300 text-xs font-bold border border-blue-500/30">
+                      Checked Out
+                    </span>
+                  ) : todayStatus?.state === "CHECKED_IN" ? (
+                    <span className="px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-xs font-bold border border-emerald-500/30">
+                      Checked In
+                    </span>
+                  ) : todayStatus?.state === "LATE" ? (
+                    <span className="px-2.5 py-0.5 rounded-full bg-amber-500/20 text-amber-300 text-xs font-bold border border-amber-500/30">
+                      Late (+{todayStatus.attendance?.late_minutes}m)
+                    </span>
+                  ) : (
+                    <span className="px-2.5 py-0.5 rounded-full bg-slate-500/20 text-slate-300 text-xs font-bold border border-slate-500/30">
+                      Not Checked In
+                    </span>
+                  )}
+                </div>
+
+                <div className="text-xs text-slate-300 flex items-center gap-4">
+                  {todayStatus?.shift ? (
+                    <span>Shift: <strong>{todayStatus.shift.name}</strong> ({todayStatus.shift.start_time.slice(0, 5)} - {todayStatus.shift.end_time.slice(0, 5)})</span>
+                  ) : (
+                    <span className="text-amber-300">No shift assigned</span>
+                  )}
+                  <span>Grace: {todayStatus?.shift?.grace_minutes || 0} mins</span>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 bg-white/5 border border-white/10 rounded-xl p-3.5 backdrop-blur-sm">
+                <div>
+                  <p className="text-[10px] font-medium text-slate-400 uppercase">Check In</p>
+                  <p className="text-sm font-bold text-white mt-0.5">{formatTime(todayStatus?.attendance?.check_in)}</p>
+                </div>
+                <div>
+                  <p className="text-[10px] font-medium text-slate-400 uppercase">Check Out</p>
+                  <p className="text-sm font-bold text-white mt-0.5">{formatTime(todayStatus?.attendance?.check_out)}</p>
+                </div>
+                <div>
+                  <p className="text-[10px] font-medium text-slate-400 uppercase">Working Time</p>
+                  <p className="text-sm font-bold text-emerald-400 mt-0.5 flex items-center gap-1">
+                    <Timer className="w-3 h-3" />
+                    {todayStatus?.attendance?.check_out
+                      ? formatMinutes(todayStatus.attendance.working_minutes)
+                      : formatMinutes(liveWorkingMinutes)}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-[10px] font-medium text-slate-400 uppercase">Late Penalty</p>
+                  <p className="text-sm font-bold text-amber-400 mt-0.5">
+                    {todayStatus?.attendance?.late_minutes ? `+${todayStatus.attendance.late_minutes}m` : "0m"}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                {todayStatus?.state === "NOT_CHECKED_IN" && todayStatus?.has_shift && (
+                  <button
+                    disabled={busy}
+                    onClick={handleCheckIn}
+                    className="flex items-center gap-2 px-5 py-3 bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-bold rounded-xl shadow-lg transition-all active:scale-95 disabled:opacity-50"
+                  >
+                    <LogIn className="w-4 h-4" /> Check In Now
+                  </button>
+                )}
+
+                {(todayStatus?.state === "CHECKED_IN" || todayStatus?.state === "LATE") && (
+                  <button
+                    disabled={busy}
+                    onClick={handleCheckOutClick}
+                    className="flex items-center gap-2 px-5 py-3 bg-rose-500 hover:bg-rose-600 text-white text-xs font-bold rounded-xl shadow-lg transition-all active:scale-95 disabled:opacity-50"
+                  >
+                    <LogOut className="w-4 h-4" /> Check Out
+                  </button>
+                )}
+
+                {todayStatus?.state === "CHECKED_OUT" && (
+                  <div className="px-4 py-2.5 bg-blue-500/20 text-blue-200 text-xs font-bold rounded-xl border border-blue-400/30 flex items-center gap-1.5">
+                    <CheckCircle2 className="w-4 h-4 text-blue-400" /> Shift Completed
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
           <div className="flex items-center justify-between">
             <h2 className="text-base font-semibold text-slate-800">My Attendance Log & Regularizations</h2>
             <button
@@ -518,8 +819,8 @@ export default function SelfService() {
                     {regularizations.map((r) => (
                       <tr key={r.id}>
                         <td className="px-6 py-3 font-bold text-slate-800">{r.attendance_date}</td>
-                        <td className="px-6 py-3 font-mono">{r.requested_check_in || "-"}</td>
-                        <td className="px-6 py-3 font-mono">{r.requested_check_out || "-"}</td>
+                        <td className="px-6 py-3 font-mono">{r.requested_check_in || "—"}</td>
+                        <td className="px-6 py-3 font-mono">{r.requested_check_out || "—"}</td>
                         <td className="px-6 py-3">{r.reason}</td>
                         <td className="px-6 py-3">
                           <span
@@ -569,14 +870,10 @@ export default function SelfService() {
                     attendanceHistory.slice(0, 15).map((att) => (
                       <tr key={att.id} className="hover:bg-slate-50/60 transition-colors">
                         <td className="px-6 py-3.5 font-bold text-slate-900">{att.attendance_date}</td>
-                        <td className="px-6 py-3.5 text-xs font-mono">
-                          {att.check_in ? new Date(att.check_in).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "-"}
-                        </td>
-                        <td className="px-6 py-3.5 text-xs font-mono">
-                          {att.check_out ? new Date(att.check_out).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "-"}
-                        </td>
-                        <td className="px-6 py-3.5 text-xs">
-                          {att.working_minutes ? `${(att.working_minutes / 60).toFixed(1)} hrs` : "-"}
+                        <td className="px-6 py-3.5 text-xs font-mono">{formatTime(att.check_in)}</td>
+                        <td className="px-6 py-3.5 text-xs font-mono">{formatTime(att.check_out)}</td>
+                        <td className="px-6 py-3.5 text-xs font-medium text-slate-800">
+                          {formatMinutes(att.working_minutes)}
                         </td>
                         <td className="px-6 py-3.5">
                           <span
@@ -674,7 +971,7 @@ export default function SelfService() {
                         <td className="px-6 py-3.5 text-xs capitalize">
                           {l.is_half_day ? `Half Day (${l.half_day_session?.replace("_", " ")})` : "Full Day"}
                         </td>
-                        <td className="px-6 py-3.5 text-xs text-slate-500">{l.reason || "-"}</td>
+                        <td className="px-6 py-3.5 text-xs text-slate-500">{l.reason || "—"}</td>
                         <td className="px-6 py-3.5">
                           <span
                             className={`px-2.5 py-0.5 text-xs font-bold rounded-full uppercase ${
@@ -797,7 +1094,7 @@ export default function SelfService() {
                         <button
                           key={v}
                           onClick={() => handleGoalProgress(g.id, v)}
-                          className={`px-2 py-0.5 text-[11px] rounded font-bold border ${
+                          className={`px-2 py-0.5 text-[11px] rounded font-bold border transition-colors ${
                             g.progress_percentage === v
                               ? "bg-indigo-600 text-white border-indigo-600"
                               : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"
@@ -811,6 +1108,195 @@ export default function SelfService() {
                 </div>
               ))
             )}
+          </div>
+        </div>
+      )}
+
+      {/* TAB 6: RESIGNATION & EXIT CLEARANCE */}
+      {activeTab === "resignation" && (
+        <div className="space-y-6">
+          <div className="flex items-center justify-between">
+            <div>
+              <h2 className="text-base font-semibold text-slate-800">Formal Resignation & Separation Portal</h2>
+              <p className="text-xs text-slate-400 mt-0.5">Submit notice, track exit clearance, and view settlement milestones</p>
+            </div>
+            {myResignations.length === 0 && (
+              <button
+                onClick={() => setShowResignModal(true)}
+                className="flex items-center gap-2 px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold rounded-lg shadow transition-colors"
+              >
+                <FileText className="w-4 h-4" />
+                Submit Resignation
+              </button>
+            )}
+          </div>
+
+          {myResignations.length === 0 ? (
+            <div className="bg-white rounded-xl border border-slate-200 p-8 text-center space-y-3">
+              <ShieldCheck className="w-12 h-12 text-slate-300 mx-auto" />
+              <h3 className="text-sm font-bold text-slate-700">No Active Separation Requests</h3>
+              <p className="text-xs text-slate-400 max-w-md mx-auto">
+                You do not have any open resignation or exit requests. Your employment status is active with regular benefits and payroll.
+              </p>
+            </div>
+          ) : (
+            myResignations.map((res) => (
+              <div key={res.id} className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 space-y-6">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-100">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h3 className="text-lg font-bold text-slate-900">Separation Reference #{res.id.slice(0, 8)}</h3>
+                      <span
+                        className={`px-2.5 py-0.5 rounded-full text-xs font-bold uppercase ${
+                          res.status === "completed"
+                            ? "bg-blue-50 text-blue-700 border border-blue-200"
+                            : res.status === "approved"
+                            ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                            : res.status === "rejected"
+                            ? "bg-rose-50 text-rose-700 border border-rose-200"
+                            : "bg-amber-50 text-amber-700 border border-amber-200"
+                        }`}
+                      >
+                        {res.status}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-400 mt-1">
+                      Submitted on <strong>{res.resignation_date}</strong> • Notice Period: <strong>{res.notice_period_days} Days</strong>
+                    </p>
+                  </div>
+
+                  <div className="text-left sm:text-right">
+                    <span className="text-xs text-slate-400 block">Final Last Working Day</span>
+                    <span className="text-base font-bold text-indigo-600">
+                      {res.final_last_working_day || res.proposed_last_working_day}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="bg-slate-50 rounded-xl p-4 border border-slate-100">
+                  <h4 className="text-xs font-bold text-slate-500 uppercase tracking-wider">Reason for Separation</h4>
+                  <p className="text-xs text-slate-700 mt-1">{res.reason}</p>
+                  {res.comments && (
+                    <div className="mt-3 pt-3 border-t border-slate-200 text-xs">
+                      <strong className="text-slate-600">Manager/HR Feedback:</strong>
+                      <p className="text-slate-500 mt-0.5">{res.comments}</p>
+                    </div>
+                  )}
+                </div>
+
+                {/* Separation Milestones Checklist */}
+                <div>
+                  <h4 className="text-xs font-bold text-slate-700 uppercase tracking-wider mb-3">
+                    Exit Clearance Checklist
+                  </h4>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    <div className="p-4 rounded-xl border border-slate-200 bg-white space-y-1">
+                      <span className="text-[11px] font-semibold text-slate-400 block">Hardware & Assets</span>
+                      <div className="flex items-center gap-2">
+                        {res.asset_returned ? (
+                          <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                        ) : (
+                          <Clock className="w-4 h-4 text-amber-500" />
+                        )}
+                        <span className="text-xs font-bold text-slate-800">
+                          {res.asset_returned ? "Assets Handed Over" : "Pending Return"}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="p-4 rounded-xl border border-slate-200 bg-white space-y-1">
+                      <span className="text-[11px] font-semibold text-slate-400 block">Department Clearance</span>
+                      <div className="flex items-center gap-2">
+                        {res.clearance_status === "completed" ? (
+                          <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                        ) : (
+                          <Clock className="w-4 h-4 text-amber-500" />
+                        )}
+                        <span className="text-xs font-bold text-slate-800 capitalize">
+                          {res.clearance_status.replace("_", " ")}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="p-4 rounded-xl border border-slate-200 bg-white space-y-1">
+                      <span className="text-[11px] font-semibold text-slate-400 block">Final Settlement (FnF)</span>
+                      <div className="flex items-center gap-2">
+                        {res.final_settlement_status === "paid" ? (
+                          <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                        ) : (
+                          <Clock className="w-4 h-4 text-amber-500" />
+                        )}
+                        <span className="text-xs font-bold text-slate-800 capitalize">
+                          {res.final_settlement_status}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      )}
+
+      {/* MODAL: SUBMIT RESIGNATION */}
+      {showResignModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-md overflow-hidden border border-slate-100">
+            <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between">
+              <h3 className="text-base font-bold text-slate-900">Submit Resignation</h3>
+              <button
+                onClick={() => setShowResignModal(false)}
+                className="p-1 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleApplyResign} className="p-6 space-y-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">Proposed Last Working Day *</label>
+                <input
+                  type="date"
+                  required
+                  value={resignForm.proposed_last_working_day}
+                  onChange={(e) => setResignForm({ ...resignForm, proposed_last_working_day: e.target.value })}
+                  className="w-full text-sm bg-slate-50 border border-slate-200 rounded-lg px-3 py-2"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">Reason for Resignation *</label>
+                <textarea
+                  rows={3}
+                  required
+                  placeholder="Detail your reasons for departure, future plans, or transition handover..."
+                  value={resignForm.reason}
+                  onChange={(e) => setResignForm({ ...resignForm, reason: e.target.value })}
+                  className="w-full text-sm bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 focus:ring-2 focus:ring-indigo-500"
+                />
+              </div>
+
+              <div className="p-3 bg-amber-50 rounded-xl border border-amber-200 text-xs text-amber-800">
+                Submitting a formal resignation will notify your reporting manager and HR department to initiate the notice period and transition roadmap.
+              </div>
+
+              <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => setShowResignModal(false)}
+                  className="px-4 py-2 text-sm text-slate-600 hover:bg-slate-100 rounded-lg font-medium"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 text-sm bg-rose-600 hover:bg-rose-700 text-white rounded-lg font-medium shadow"
+                >
+                  Confirm & Submit
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

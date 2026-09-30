@@ -78,3 +78,4 @@ def delete_announcement(
     a.is_active = False
     db.commit()
     return None
+

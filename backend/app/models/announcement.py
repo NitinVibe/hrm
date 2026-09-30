@@ -20,3 +20,4 @@ class Announcement(Base):
     organization = relationship("Organization")
     published_by = relationship("User")
 from app.models.notification import Notification
+

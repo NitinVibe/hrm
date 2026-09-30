@@ -339,3 +339,4 @@ def get_payslip(
     if not p:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payslip not found.")
     return p
+

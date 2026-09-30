@@ -19,3 +19,4 @@ class AuditLog(Base):
 
     organization = relationship("Organization")
     user = relationship("User")
+

@@ -4,6 +4,7 @@ from sqlalchemy import text
 
 from app.db.session import engine
 from app.core.redis import get_redis
+import app.models
 
 # Core routers
 from app.api.v1.auth import router as auth_router
@@ -27,6 +28,7 @@ from app.api.v1.audit_logs import router as audit_logs_router
 from app.api.v1.analytics import router as analytics_router
 from app.api.v1.notifications import router as notifications_router
 from app.api.v1.search import router as search_router
+from app.api.v1.resignations import router as resignations_router
 
 app = FastAPI(
     title="HRM Enterprise SaaS API",
@@ -93,3 +95,4 @@ app.include_router(audit_logs_router, prefix="/api/v1")
 app.include_router(analytics_router, prefix="/api/v1")
 app.include_router(notifications_router, prefix="/api/v1")
 app.include_router(search_router, prefix="/api/v1")
+app.include_router(resignations_router, prefix="/api/v1")

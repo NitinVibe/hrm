@@ -196,3 +196,4 @@ def get_reports_summary(
         "branches": branch_headcount,
         "leaves": leave_stats,
     }
+
