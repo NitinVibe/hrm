@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { CalendarCheck, LogIn, LogOut } from "lucide-react";
+import { LogIn, LogOut } from "lucide-react";
 import { getAttendance, myCheckIn, myCheckOut, type Attendance as AttendanceRecord } from "../api/attendance";
 import { getEmployees, type Employee } from "../api/employees";
 

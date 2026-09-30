@@ -1,6 +1,7 @@
 import uuid
-
+from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -23,14 +24,16 @@ from app.schemas.auth import (
     UserResponse,
 )
 from app.core.auth_dependencies import get_current_user
+from app.core.permissions import require_org_admin
 
 router = APIRouter(
     prefix="/auth",
     tags=["Authentication"],
 )
-from fastapi.security import OAuth2PasswordRequestForm
 
-from app.core.permissions import require_org_admin
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
 
 @router.post(
     "/register",
@@ -41,10 +44,6 @@ def register(
     data: RegisterRequest,
     db: Session = Depends(get_db),
 ):
-    # --------------------------------
-    # 1. Check if email already exists
-    # --------------------------------
-
     existing_user = db.scalar(
         select(User).where(
             User.email == data.email.lower()
@@ -53,13 +52,9 @@ def register(
 
     if existing_user:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email is already registered.",
         )
-
-    # --------------------------------
-    # 2. Check organization slug
-    # --------------------------------
 
     existing_org = db.scalar(
         select(Organization).where(
@@ -69,13 +64,9 @@ def register(
 
     if existing_org:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="Organization slug is already in use.",
         )
-
-    # --------------------------------
-    # 3. Find ORG_ADMIN role
-    # --------------------------------
 
     org_admin_role = db.scalar(
         select(Role).where(
@@ -89,10 +80,6 @@ def register(
             detail="ORG_ADMIN role is missing.",
         )
 
-    # --------------------------------
-    # 4. Create organization
-    # --------------------------------
-
     organization = Organization(
         name=data.organization_name,
         slug=data.organization_slug.lower(),
@@ -100,10 +87,6 @@ def register(
 
     db.add(organization)
     db.flush()
-
-    # --------------------------------
-    # 5. Create user
-    # --------------------------------
 
     user = User(
         organization_id=organization.id,
@@ -115,38 +98,15 @@ def register(
     )
 
     db.add(user)
-    db.flush()
-
-    # --------------------------------
-    # 6. Create employee profile
-    # --------------------------------
-
-    employee = Employee(
-        organization_id=organization.id,
-        user_id=user.id,
-        employee_code=f"EMP-{uuid.uuid4().hex[:8].upper()}",
-        first_name=data.first_name,
-        last_name=data.last_name,
-        email=data.email.lower(),
-        employment_status="active",
-    )
-
-    db.add(employee)
-
-    # --------------------------------
-    # 7. Commit everything
-    # --------------------------------
-
     db.commit()
+    db.refresh(user)
+    db.refresh(organization)
 
     return RegisterResponse(
-        message="Organization and admin account created successfully.",
-        user=UserResponse(
-            id=str(user.id),
-            email=user.email,
-            role=org_admin_role.name,
-            organization_id=str(organization.id),
-        ),
+        organization_id=organization.id,
+        user_id=user.id,
+        email=user.email,
+        message="Organization and admin user created successfully.",
     )
 
 @router.post(
@@ -157,16 +117,29 @@ def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db),
 ):
+    identifier = form_data.username.strip()
+
+    # 1. Try lookup by email
     user = db.scalar(
         select(User).where(
-            User.email == form_data.username.lower()
+            User.email == identifier.lower()
         )
     )
+
+    # 2. Try lookup by employee code
+    if not user:
+        emp = db.scalar(
+            select(Employee).where(
+                Employee.employee_code.ilike(identifier)
+            )
+        )
+        if emp and emp.user_id:
+            user = db.scalar(select(User).where(User.id == emp.user_id))
 
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password.",
+            detail="Invalid email/Employee ID or password.",
         )
 
     if not user.is_active:
@@ -181,7 +154,7 @@ def login(
     ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password.",
+            detail="Invalid email/Employee ID or password.",
         )
 
     access_token = create_access_token(
@@ -208,14 +181,64 @@ def get_me(
         )
     )
 
+    org = db.scalar(
+        select(Organization).where(
+            Organization.id == current_user.organization_id
+        )
+    )
+
+    emp = db.scalar(
+        select(Employee).where(
+            Employee.user_id == current_user.id
+        )
+    )
+
+    role_name = role.name if role else "EMPLOYEE"
+
     return {
         "id": str(current_user.id),
         "email": current_user.email,
-        "organization_id": str(
-            current_user.organization_id
-        ),
-        "role": role.name if role else None,
+        "organization_id": str(current_user.organization_id),
+        "role": role_name,
+        "user": {
+            "id": str(current_user.id),
+            "email": current_user.email,
+            "role": role_name,
+        },
+        "organization": {
+            "id": str(org.id) if org else str(current_user.organization_id),
+            "name": org.name if org else "Enterprise Organization",
+            "slug": org.slug if org else "default",
+        },
+        "employee": {
+            "id": str(emp.id),
+            "first_name": emp.first_name,
+            "last_name": emp.last_name,
+            "employee_code": emp.employee_code,
+            "department_id": str(emp.department_id) if emp.department_id else None,
+            "designation_id": str(emp.designation_id) if emp.designation_id else None,
+            "branch_id": str(emp.branch_id) if emp.branch_id else None,
+            "employment_status": emp.employment_status,
+            "joining_date": emp.joining_date.isoformat() if emp.joining_date else None,
+            "phone": emp.phone,
+        } if emp else None,
     }
+
+@router.post("/change-password")
+def change_password(
+    data: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not verify_password(data.current_password, current_user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password does not match.",
+        )
+
+    current_user.password_hash = hash_password(data.new_password)
+    db.commit()
+    return {"message": "Password changed successfully."}
 
 @router.get("/admin-test")
 def admin_test(

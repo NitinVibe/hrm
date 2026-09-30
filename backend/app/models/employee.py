@@ -7,7 +7,6 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 
 
-
 class Employee(Base):
     __tablename__ = "employees"
 
@@ -23,13 +22,31 @@ class Employee(Base):
     )
 
     department_id: Mapped[uuid.UUID | None] = mapped_column(
-    ForeignKey("departments.id"),
-    nullable=True,
-    index=True,
+        ForeignKey("departments.id"),
+        nullable=True,
+        index=True,
     )
 
     designation_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("designations.id"),
+        nullable=True,
+        index=True,
+    )
+
+    shift_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("shifts.id"),
+        nullable=True,
+        index=True,
+    )
+
+    branch_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("branches.id"),
+        nullable=True,
+        index=True,
+    )
+
+    reporting_manager_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("employees.id"),
         nullable=True,
         index=True,
     )
@@ -82,6 +99,26 @@ class Employee(Base):
         nullable=False,
     )
 
+    employment_type: Mapped[str] = mapped_column(
+        String(50),
+        default="Full-Time",
+        nullable=False,
+    )
+
+    gender: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    marital_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    blood_group: Mapped[str | None] = mapped_column(String(10), nullable=True)
+
+    emergency_contact_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    emergency_contact_phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    emergency_contact_relation: Mapped[str | None] = mapped_column(String(50), nullable=True)
+
+    bank_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    account_number: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    ifsc_code: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    pan_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    aadhar_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,
@@ -94,12 +131,6 @@ class Employee(Base):
         onupdate=datetime.utcnow,
         nullable=False,
     )
-    shift_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("shifts.id"),
-        nullable=True,
-        index=True,
-    )
-    
 
     organization = relationship(
         "Organization",
@@ -114,3 +145,5 @@ class Employee(Base):
     department = relationship("Department")
     designation = relationship("Designation")
     shift = relationship("Shift")
+    branch = relationship("Branch", back_populates="employees")
+    reporting_manager = relationship("Employee", remote_side=[id])
