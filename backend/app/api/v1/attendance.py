@@ -269,7 +269,7 @@ def list_attendance(
     end_date: date | None = Query(
         default=None,
     ),
-    current_user: User = Depends(require_hr),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     query = select(Attendance).where(
@@ -278,10 +278,20 @@ def list_attendance(
     )
 
     # -----------------------------------------------------
-    # Employee filter
+    # Role-based scoping
     # -----------------------------------------------------
-
-    if employee_id is not None:
+    role_name = current_user.role.name if current_user.role else "EMPLOYEE"
+    if role_name not in ["ORG_ADMIN", "HR_MANAGER"]:
+        emp = db.scalar(
+            select(Employee).where(
+                Employee.user_id == current_user.id,
+                Employee.organization_id == current_user.organization_id,
+            )
+        )
+        if not emp:
+            return []
+        query = query.where(Attendance.employee_id == emp.id)
+    elif employee_id is not None:
         query = query.where(
             Attendance.employee_id == employee_id
         )
