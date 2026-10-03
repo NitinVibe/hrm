@@ -25,6 +25,7 @@ from app.schemas.recruitment import (
     InterviewResponse,
 )
 from app.services.audit import log_audit
+from app.services.notifications import send_notification, notify_admins_and_hr
 
 router = APIRouter(prefix="/recruitment", tags=["Recruitment & ATS"])
 
@@ -219,6 +220,15 @@ def convert_candidate_to_employee(
         entity_type="employee",
         entity_id=str(emp.id),
         details={"employee_code": emp_code, "candidate_id": str(c.id)},
+    )
+
+    notify_admins_and_hr(
+        db,
+        current_user.organization_id,
+        "New Employee Hired",
+        f"{c.first_name} {c.last_name or ''} ({emp_code}) was onboarded into the organization.",
+        "recruitment",
+        "/employees",
     )
 
     db.commit()

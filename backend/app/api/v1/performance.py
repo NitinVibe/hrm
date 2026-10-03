@@ -9,6 +9,7 @@ from app.core.permissions import require_hr, require_employee
 from app.db.dependencies import get_db
 from app.models.performance import PerformanceCycle, Goal, PerformanceReview
 from app.models.employee import Employee
+from app.models.role import Role
 from app.models.user import User
 from app.schemas.performance import (
     PerformanceCycleCreate,
@@ -22,6 +23,7 @@ from app.schemas.performance import (
     PerformanceReviewResponse,
 )
 from app.services.audit import log_audit
+from app.services.notifications import send_notification
 
 router = APIRouter(prefix="/performance", tags=["Performance & OKRs"])
 
@@ -64,8 +66,45 @@ def list_goals(
     db: Session = Depends(get_db),
 ):
     query = select(Goal).where(Goal.organization_id == current_user.organization_id)
-    if employee_id:
-        query = query.where(Goal.employee_id == employee_id)
+    role = db.scalar(select(Role).where(Role.id == current_user.role_id))
+    role_name = role.name.upper() if role else "EMPLOYEE"
+
+    if role_name == "EMPLOYEE":
+        user_emp = db.scalar(
+            select(Employee).where(
+                Employee.user_id == current_user.id,
+                Employee.organization_id == current_user.organization_id,
+            )
+        )
+        if not user_emp:
+            return []
+        query = query.where(Goal.employee_id == user_emp.id)
+    elif role_name == "MANAGER":
+        mgr_emp = db.scalar(
+            select(Employee).where(
+                Employee.user_id == current_user.id,
+                Employee.organization_id == current_user.organization_id,
+            )
+        )
+        if not mgr_emp:
+            return []
+        sub_ids = db.scalars(
+            select(Employee.id).where(
+                Employee.organization_id == current_user.organization_id,
+                Employee.reporting_manager_id == mgr_emp.id,
+            )
+        ).all()
+        allowed_ids = set(sub_ids) | {mgr_emp.id}
+        if employee_id:
+            if employee_id not in allowed_ids:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Managers can only view goals for their team.")
+            query = query.where(Goal.employee_id == employee_id)
+        else:
+            query = query.where(Goal.employee_id.in_(allowed_ids))
+    else:
+        if employee_id:
+            query = query.where(Goal.employee_id == employee_id)
+
     if cycle_id:
         query = query.where(Goal.cycle_id == cycle_id)
     return db.scalars(query.order_by(Goal.created_at.desc())).all()
@@ -73,9 +112,36 @@ def list_goals(
 @router.post("/goals", response_model=GoalResponse, status_code=status.HTTP_201_CREATED)
 def create_goal(
     data: GoalCreate,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_employee),
     db: Session = Depends(get_db),
 ):
+    role = db.scalar(select(Role).where(Role.id == current_user.role_id))
+    role_name = role.name.upper() if role else "EMPLOYEE"
+
+    target_emp = db.scalar(
+        select(Employee).where(
+            Employee.id == data.employee_id,
+            Employee.organization_id == current_user.organization_id,
+        )
+    )
+    if not target_emp:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Employee not found.")
+
+    if role_name == "EMPLOYEE":
+        if target_emp.user_id != current_user.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Employees can only create goals for themselves.")
+    elif role_name == "MANAGER":
+        mgr_emp = db.scalar(
+            select(Employee).where(
+                Employee.user_id == current_user.id,
+                Employee.organization_id == current_user.organization_id,
+            )
+        )
+        if not mgr_emp:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Manager profile not found.")
+        if target_emp.id != mgr_emp.id and target_emp.reporting_manager_id != mgr_emp.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Managers can only create goals for their team.")
+
     g = Goal(
         organization_id=current_user.organization_id,
         employee_id=data.employee_id,
@@ -110,6 +176,38 @@ def update_goal(
     if not g:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Goal not found.")
 
+    role = db.scalar(select(Role).where(Role.id == current_user.role_id))
+    role_name = role.name.upper() if role else "EMPLOYEE"
+
+    if role_name == "EMPLOYEE":
+        user_emp = db.scalar(
+            select(Employee).where(
+                Employee.user_id == current_user.id,
+                Employee.organization_id == current_user.organization_id,
+            )
+        )
+        if not user_emp or user_emp.id != g.employee_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Employees can only update their own goals.")
+    elif role_name == "MANAGER":
+        mgr_emp = db.scalar(
+            select(Employee).where(
+                Employee.user_id == current_user.id,
+                Employee.organization_id == current_user.organization_id,
+            )
+        )
+        if not mgr_emp:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Manager profile not found.")
+        if g.employee_id != mgr_emp.id:
+            sub = db.scalar(
+                select(Employee).where(
+                    Employee.id == g.employee_id,
+                    Employee.reporting_manager_id == mgr_emp.id,
+                    Employee.organization_id == current_user.organization_id,
+                )
+            )
+            if not sub:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Managers can only update goals for their team.")
+
     for field, val in data.model_dump(exclude_unset=True).items():
         setattr(g, field, val)
 
@@ -135,6 +233,39 @@ def delete_goal(
     )
     if not g:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Goal not found.")
+
+    role = db.scalar(select(Role).where(Role.id == current_user.role_id))
+    role_name = role.name.upper() if role else "EMPLOYEE"
+
+    if role_name == "EMPLOYEE":
+        user_emp = db.scalar(
+            select(Employee).where(
+                Employee.user_id == current_user.id,
+                Employee.organization_id == current_user.organization_id,
+            )
+        )
+        if not user_emp or user_emp.id != g.employee_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Employees can only delete their own goals.")
+    elif role_name == "MANAGER":
+        mgr_emp = db.scalar(
+            select(Employee).where(
+                Employee.user_id == current_user.id,
+                Employee.organization_id == current_user.organization_id,
+            )
+        )
+        if not mgr_emp:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Manager profile not found.")
+        if g.employee_id != mgr_emp.id:
+            sub = db.scalar(
+                select(Employee).where(
+                    Employee.id == g.employee_id,
+                    Employee.reporting_manager_id == mgr_emp.id,
+                    Employee.organization_id == current_user.organization_id,
+                )
+            )
+            if not sub:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Managers can only delete goals for their team.")
+
     db.delete(g)
     db.commit()
     return None
@@ -148,8 +279,45 @@ def list_reviews(
     db: Session = Depends(get_db),
 ):
     query = select(PerformanceReview).where(PerformanceReview.organization_id == current_user.organization_id)
-    if employee_id:
-        query = query.where(PerformanceReview.employee_id == employee_id)
+    role = db.scalar(select(Role).where(Role.id == current_user.role_id))
+    role_name = role.name.upper() if role else "EMPLOYEE"
+
+    if role_name == "EMPLOYEE":
+        user_emp = db.scalar(
+            select(Employee).where(
+                Employee.user_id == current_user.id,
+                Employee.organization_id == current_user.organization_id,
+            )
+        )
+        if not user_emp:
+            return []
+        query = query.where(PerformanceReview.employee_id == user_emp.id)
+    elif role_name == "MANAGER":
+        mgr_emp = db.scalar(
+            select(Employee).where(
+                Employee.user_id == current_user.id,
+                Employee.organization_id == current_user.organization_id,
+            )
+        )
+        if not mgr_emp:
+            return []
+        sub_ids = db.scalars(
+            select(Employee.id).where(
+                Employee.organization_id == current_user.organization_id,
+                Employee.reporting_manager_id == mgr_emp.id,
+            )
+        ).all()
+        allowed_ids = set(sub_ids) | {mgr_emp.id}
+        if employee_id:
+            if employee_id not in allowed_ids:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Managers can only view reviews for their team.")
+            query = query.where(PerformanceReview.employee_id == employee_id)
+        else:
+            query = query.where(PerformanceReview.employee_id.in_(allowed_ids))
+    else:
+        if employee_id:
+            query = query.where(PerformanceReview.employee_id == employee_id)
+
     if cycle_id:
         query = query.where(PerformanceReview.cycle_id == cycle_id)
     return db.scalars(query.order_by(PerformanceReview.created_at.desc())).all()
@@ -160,6 +328,33 @@ def create_review(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    role = db.scalar(select(Role).where(Role.id == current_user.role_id))
+    role_name = role.name.upper() if role else "EMPLOYEE"
+
+    target_emp = db.scalar(
+        select(Employee).where(
+            Employee.id == data.employee_id,
+            Employee.organization_id == current_user.organization_id,
+        )
+    )
+    if not target_emp:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Employee not found.")
+
+    if role_name == "EMPLOYEE":
+        if target_emp.user_id != current_user.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Employees can only submit self-reviews.")
+    elif role_name == "MANAGER":
+        mgr_emp = db.scalar(
+            select(Employee).where(
+                Employee.user_id == current_user.id,
+                Employee.organization_id == current_user.organization_id,
+            )
+        )
+        if not mgr_emp:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Manager profile not found.")
+        if target_emp.id != mgr_emp.id and target_emp.reporting_manager_id != mgr_emp.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Managers can only initiate reviews for their team.")
+
     r = PerformanceReview(
         organization_id=current_user.organization_id,
         cycle_id=data.cycle_id,
@@ -170,6 +365,21 @@ def create_review(
         status="pending_manager",
     )
     db.add(r)
+    db.flush()
+
+    if data.reviewer_id:
+        rev_emp = db.scalar(select(Employee).where(Employee.id == data.reviewer_id))
+        if rev_emp and rev_emp.user_id:
+            send_notification(
+                db,
+                current_user.organization_id,
+                rev_emp.user_id,
+                "Performance Review Submitted",
+                "A team member submitted a self-review awaiting your manager evaluation.",
+                "performance",
+                "/manager-portal",
+            )
+
     db.commit()
     db.refresh(r)
     return r
@@ -190,6 +400,34 @@ def update_review(
     if not r:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Review not found.")
 
+    role = db.scalar(select(Role).where(Role.id == current_user.role_id))
+    role_name = role.name.upper() if role else "EMPLOYEE"
+
+    if role_name == "EMPLOYEE":
+        user_emp = db.scalar(
+            select(Employee).where(
+                Employee.user_id == current_user.id,
+                Employee.organization_id == current_user.organization_id,
+            )
+        )
+        if not user_emp or user_emp.id != r.employee_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Employees can only update their own self-reviews.")
+        # Employee cannot update manager rating or final rating
+        if data.manager_rating is not None or data.manager_feedback is not None:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Employees cannot submit manager ratings.")
+    elif role_name == "MANAGER":
+        mgr_emp = db.scalar(
+            select(Employee).where(
+                Employee.user_id == current_user.id,
+                Employee.organization_id == current_user.organization_id,
+            )
+        )
+        if not mgr_emp:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Manager profile not found.")
+        target_emp = db.scalar(select(Employee).where(Employee.id == r.employee_id))
+        if not target_emp or (target_emp.reporting_manager_id != mgr_emp.id and target_emp.id != mgr_emp.id):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Managers can only evaluate their direct reports.")
+
     for field, val in data.model_dump(exclude_unset=True).items():
         setattr(r, field, val)
 
@@ -198,6 +436,20 @@ def update_review(
         r.status = "completed"
 
     r.updated_at = datetime.utcnow()
+
+    if r.status == "completed":
+        emp = db.scalar(select(Employee).where(Employee.id == r.employee_id))
+        if emp and emp.user_id:
+            send_notification(
+                db,
+                current_user.organization_id,
+                emp.user_id,
+                "Performance Appraisal Completed",
+                f"Your performance appraisal is completed with final rating {r.final_rating}/5.0.",
+                "performance",
+                "/self-service",
+            )
+
     db.commit()
     db.refresh(r)
     return r

@@ -1,7 +1,8 @@
+import calendar
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from fastapi import APIRouter, Depends, HTTPException, status, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.auth_dependencies import get_current_user
@@ -9,6 +10,9 @@ from app.core.permissions import require_hr, require_org_admin, require_employee
 from app.db.dependencies import get_db
 from app.models.payroll import SalaryStructure, EmployeeSalary, PayrollRun, Payslip
 from app.models.employee import Employee
+from app.models.attendance import Attendance
+from app.models.leave import Leave
+from app.models.role import Role
 from app.models.user import User
 from app.schemas.payroll import (
     SalaryStructureCreate,
@@ -21,6 +25,7 @@ from app.schemas.payroll import (
     PayslipResponse,
 )
 from app.services.audit import log_audit
+from app.services.notifications import send_notification
 
 router = APIRouter(prefix="/payroll", tags=["Payroll & Compensation"])
 
@@ -141,6 +146,9 @@ def list_payroll_runs(
     ).all()
 
 @router.post("/process", response_model=PayrollRunResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/runs/process", response_model=PayrollRunResponse)
+@router.post("/runs", response_model=PayrollRunResponse)
+@router.post("/process", response_model=PayrollRunResponse)
 def process_payroll_run(
     data: PayrollRunProcess,
     current_user: User = Depends(require_hr),
@@ -192,6 +200,24 @@ def process_payroll_run(
         )
     ).all()
 
+    # Calculate month calendar boundaries and total working days (Mon-Fri)
+    num_days = calendar.monthrange(data.year, data.month)[1]
+    start_dt = date(data.year, data.month, 1)
+    end_dt = date(data.year, data.month, num_days)
+    calendar_working_days = sum(
+        1 for d in range(1, num_days + 1)
+        if date(data.year, data.month, d).weekday() < 5
+    )
+    month_working_days = calendar_working_days if calendar_working_days > 0 else 22
+
+    # Check for default salary structure in org in case an employee lacks an active EmployeeSalary
+    default_structure = db.scalar(
+        select(SalaryStructure).where(
+            SalaryStructure.organization_id == org_id,
+            SalaryStructure.is_active == True,
+        ).order_by(SalaryStructure.base_annual_ctc.asc())
+    )
+
     total_gross = 0.0
     total_deductions = 0.0
     total_net = 0.0
@@ -204,16 +230,90 @@ def process_payroll_run(
                 EmployeeSalary.is_active == True,
             )
         )
-        basic = salary_rec.basic_salary if salary_rec else 50000.0
-        hra = salary_rec.hra if salary_rec else 20000.0
-        allowances = (salary_rec.conveyance_allowance + salary_rec.special_allowance) if salary_rec else 15000.0
-        emp_gross = basic + hra + allowances
+        if not salary_rec:
+            # If no salary record, initialize one from default structure or baseline
+            monthly_ctc = (default_structure.base_annual_ctc / 12.0) if default_structure else 60000.0
+            basic_calc = round(monthly_ctc * 0.50, 2)
+            hra_calc = round(monthly_ctc * 0.25, 2)
+            conveyance_calc = round(monthly_ctc * 0.10, 2)
+            special_calc = round(monthly_ctc * 0.15, 2)
+            pf_calc = round(basic_calc * 0.12, 2)
+            esi_calc = round(monthly_ctc * 0.0075, 2)
+            tax_calc = round(monthly_ctc * 0.05, 2)
+            gross_calc = round(basic_calc + hra_calc + conveyance_calc + special_calc, 2)
+            net_calc = round(gross_calc - pf_calc - esi_calc - tax_calc, 2)
 
-        pf = salary_rec.pf_deduction if salary_rec else (basic * 0.12)
-        tax = salary_rec.tds_tax_deduction if salary_rec else (emp_gross * 0.10)
-        other_ded = salary_rec.esi_deduction if salary_rec else 0.0
-        emp_deductions = pf + tax + other_ded
-        emp_net = max(0.0, emp_gross - emp_deductions)
+            salary_rec = EmployeeSalary(
+                organization_id=org_id,
+                employee_id=emp.id,
+                effective_date=start_dt,
+                basic_salary=basic_calc,
+                hra=hra_calc,
+                conveyance_allowance=conveyance_calc,
+                special_allowance=special_calc,
+                pf_deduction=pf_calc,
+                esi_deduction=esi_calc,
+                tds_tax_deduction=tax_calc,
+                gross_salary=gross_calc,
+                net_salary=net_calc,
+                is_active=True,
+            )
+            db.add(salary_rec)
+            db.flush()
+
+        # Query real present days from Attendance table
+        present_count = db.scalar(
+            select(func.count(Attendance.id)).where(
+                Attendance.organization_id == org_id,
+                Attendance.employee_id == emp.id,
+                Attendance.attendance_date >= start_dt,
+                Attendance.attendance_date <= end_dt,
+                Attendance.status.in_(["present", "late"]),
+            )
+        ) or 0
+
+        # Query real approved leave days from Leave table
+        approved_leaves = db.scalars(
+            select(Leave).where(
+                Leave.organization_id == org_id,
+                Leave.employee_id == emp.id,
+                Leave.status == "approved",
+                Leave.start_date <= end_dt,
+                Leave.end_date >= start_dt,
+            )
+        ).all()
+
+        leave_days_count = 0.0
+        for lv in approved_leaves:
+            overlap_start = max(lv.start_date, start_dt)
+            overlap_end = min(lv.end_date, end_dt)
+            if lv.is_half_day:
+                leave_days_count += 0.5
+            else:
+                leave_days_count += float((overlap_end - overlap_start).days + 1)
+
+        # Determine payable days & ratio
+        if present_count == 0 and leave_days_count == 0:
+            actual_present = month_working_days
+            actual_leaves = 0
+            payable_days = float(month_working_days)
+        else:
+            actual_present = int(present_count)
+            actual_leaves = int(leave_days_count)
+            payable_days = min(float(present_count) + float(leave_days_count), float(month_working_days))
+
+        pay_ratio = max(0.1, min(1.0, payable_days / float(month_working_days)))
+
+        basic = round(salary_rec.basic_salary * pay_ratio, 2)
+        hra = round(salary_rec.hra * pay_ratio, 2)
+        allowances = round((salary_rec.conveyance_allowance + salary_rec.special_allowance) * pay_ratio, 2)
+        emp_gross = round(basic + hra + allowances, 2)
+
+        pf = round(salary_rec.pf_deduction * pay_ratio, 2)
+        tax = round(salary_rec.tds_tax_deduction * pay_ratio, 2)
+        other_ded = round(salary_rec.esi_deduction * pay_ratio, 2)
+        emp_deductions = round(pf + tax + other_ded, 2)
+        emp_net = max(0.0, round(emp_gross - emp_deductions, 2))
 
         total_gross += emp_gross
         total_deductions += emp_deductions
@@ -225,9 +325,9 @@ def process_payroll_run(
             employee_id=emp.id,
             month=data.month,
             year=data.year,
-            working_days=22,
-            present_days=21,
-            leave_days=1,
+            working_days=month_working_days,
+            present_days=actual_present,
+            leave_days=actual_leaves,
             basic_salary=basic,
             hra=hra,
             allowances=allowances,
@@ -281,12 +381,60 @@ def approve_payroll_run(
     for s in slips:
         s.status = "paid"
         s.paid_at = now
+        emp = db.scalar(select(Employee).where(Employee.id == s.employee_id))
+        if emp and emp.user_id:
+            send_notification(
+                db,
+                current_user.organization_id,
+                emp.user_id,
+                "Payslip Ready",
+                f"Your payslip for {pr.month}/{pr.year} is now available.",
+                "payroll",
+                "/self-service",
+            )
 
     log_audit(
         db,
         organization_id=current_user.organization_id,
         user_id=current_user.id,
         action="APPROVE_PAYROLL",
+        entity_type="payroll_run",
+        entity_id=str(pr.id),
+        details={"month": pr.month, "year": pr.year},
+    )
+
+    db.commit()
+    db.refresh(pr)
+    return pr
+
+@router.patch("/runs/{run_id}/pay", response_model=PayrollRunResponse)
+def mark_payroll_paid(
+    run_id: uuid.UUID,
+    current_user: User = Depends(require_org_admin),
+    db: Session = Depends(get_db),
+):
+    pr = db.scalar(
+        select(PayrollRun).where(
+            PayrollRun.id == run_id,
+            PayrollRun.organization_id == current_user.organization_id,
+        )
+    )
+    if not pr:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payroll run not found.")
+
+    pr.status = "paid"
+    slips = db.scalars(select(Payslip).where(Payslip.payroll_run_id == pr.id)).all()
+    now = datetime.utcnow()
+    for s in slips:
+        s.status = "paid"
+        if not s.paid_at:
+            s.paid_at = now
+
+    log_audit(
+        db,
+        organization_id=current_user.organization_id,
+        user_id=current_user.id,
+        action="PAY_PAYROLL",
         entity_type="payroll_run",
         entity_id=str(pr.id),
         details={"month": pr.month, "year": pr.year},
@@ -307,14 +455,48 @@ def list_payslips(
 ):
     query = select(Payslip).where(Payslip.organization_id == current_user.organization_id)
 
-    # Check if user is an employee (non-HR/non-Admin)
-    user_emp = db.scalar(select(Employee).where(Employee.user_id == current_user.id))
-    # If the user is a normal employee, force filter to their own records only!
-    role = db.scalar(select(User).where(User.id == current_user.id)).role
-    if role and role.name == "EMPLOYEE" and user_emp:
+    role = db.scalar(select(Role).where(Role.id == current_user.role_id))
+    role_name = role.name.upper() if role else "EMPLOYEE"
+
+    if role_name == "EMPLOYEE":
+        user_emp = db.scalar(
+            select(Employee).where(
+                Employee.user_id == current_user.id,
+                Employee.organization_id == current_user.organization_id,
+            )
+        )
+        if not user_emp:
+            return []
         query = query.where(Payslip.employee_id == user_emp.id)
-    elif employee_id:
-        query = query.where(Payslip.employee_id == employee_id)
+    elif role_name == "MANAGER":
+        mgr_emp = db.scalar(
+            select(Employee).where(
+                Employee.user_id == current_user.id,
+                Employee.organization_id == current_user.organization_id,
+            )
+        )
+        if not mgr_emp:
+            return []
+        sub_ids = db.scalars(
+            select(Employee.id).where(
+                Employee.organization_id == current_user.organization_id,
+                Employee.reporting_manager_id == mgr_emp.id,
+            )
+        ).all()
+        allowed_ids = set(sub_ids) | {mgr_emp.id}
+        if employee_id:
+            if employee_id not in allowed_ids:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Managers can only view payslips for their team.",
+                )
+            query = query.where(Payslip.employee_id == employee_id)
+        else:
+            query = query.where(Payslip.employee_id.in_(allowed_ids))
+    else:
+        # HR / ORG_ADMIN / SUPER_ADMIN
+        if employee_id:
+            query = query.where(Payslip.employee_id == employee_id)
 
     if month:
         query = query.where(Payslip.month == month)
@@ -338,5 +520,44 @@ def get_payslip(
     )
     if not p:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payslip not found.")
+
+    role = db.scalar(select(Role).where(Role.id == current_user.role_id))
+    role_name = role.name.upper() if role else "EMPLOYEE"
+
+    if role_name == "EMPLOYEE":
+        user_emp = db.scalar(
+            select(Employee).where(
+                Employee.user_id == current_user.id,
+                Employee.organization_id == current_user.organization_id,
+            )
+        )
+        if not user_emp or user_emp.id != p.employee_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Employees can only view their own payslips.",
+            )
+    elif role_name == "MANAGER":
+        mgr_emp = db.scalar(
+            select(Employee).where(
+                Employee.user_id == current_user.id,
+                Employee.organization_id == current_user.organization_id,
+            )
+        )
+        if not mgr_emp:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Manager profile not found.")
+        if p.employee_id != mgr_emp.id:
+            sub = db.scalar(
+                select(Employee).where(
+                    Employee.id == p.employee_id,
+                    Employee.reporting_manager_id == mgr_emp.id,
+                    Employee.organization_id == current_user.organization_id,
+                )
+            )
+            if not sub:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Managers can only view payslips for their direct reports.",
+                )
+
     return p
 

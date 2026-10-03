@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from typing import Any
 
 from app.core.auth_dependencies import get_current_user
+from app.core.permissions import get_user_role_name
 from app.db.dependencies import get_db
 from app.models.user import User
 from app.models.employee import Employee
@@ -17,6 +18,7 @@ from app.models.recruitment import Candidate
 
 router = APIRouter(prefix="/search", tags=["Global Search"])
 
+
 @router.get("")
 def global_search(
     q: str = Query(..., min_length=1, description="Search term"),
@@ -25,6 +27,15 @@ def global_search(
 ):
     query_term = f"%{q.strip()}%"
     org_id = current_user.organization_id
+    role_name = get_user_role_name(current_user, db)
+
+    own_emp = db.scalar(
+        select(Employee).where(
+            Employee.user_id == current_user.id,
+            Employee.organization_id == org_id,
+        )
+    )
+
     results: dict[str, list[dict[str, Any]]] = {
         "employees": [],
         "departments": [],
@@ -36,19 +47,36 @@ def global_search(
         "leaves": [],
     }
 
-    # 1. Employees
-    emps = db.scalars(
-        select(Employee).where(
-            Employee.organization_id == org_id,
-            or_(
-                Employee.first_name.ilike(query_term),
-                Employee.last_name.ilike(query_term),
-                Employee.email.ilike(query_term),
-                Employee.employee_code.ilike(query_term),
-                Employee.phone.ilike(query_term),
-            )
-        ).limit(6)
-    ).all()
+    # 1. Employees (RBAC filtered)
+    emp_query = select(Employee).where(
+        Employee.organization_id == org_id,
+        or_(
+            Employee.first_name.ilike(query_term),
+            Employee.last_name.ilike(query_term),
+            Employee.email.ilike(query_term),
+            Employee.employee_code.ilike(query_term),
+            Employee.phone.ilike(query_term),
+        ),
+    )
+    if role_name == "EMPLOYEE":
+        if own_emp:
+            emp_query = emp_query.where(Employee.id == own_emp.id)
+        else:
+            emp_query = emp_query.where(Employee.id == None)
+    elif role_name == "MANAGER":
+        if own_emp:
+            direct_report_ids = db.scalars(
+                select(Employee.id).where(
+                    Employee.organization_id == org_id,
+                    Employee.reporting_manager_id == own_emp.id,
+                )
+            ).all()
+            allowed_ids = set(direct_report_ids) | {own_emp.id}
+            emp_query = emp_query.where(Employee.id.in_(allowed_ids))
+        else:
+            emp_query = emp_query.where(Employee.id == None)
+
+    emps = db.scalars(emp_query.limit(6)).all()
     for e in emps:
         results["employees"].append({
             "id": str(e.id),
@@ -65,7 +93,7 @@ def global_search(
             or_(
                 Department.name.ilike(query_term),
                 Department.description.ilike(query_term),
-            )
+            ),
         ).limit(5)
     ).all()
     for d in depts:
@@ -83,7 +111,7 @@ def global_search(
             or_(
                 Designation.name.ilike(query_term),
                 Designation.description.ilike(query_term),
-            )
+            ),
         ).limit(5)
     ).all()
     for ds in desigs:
@@ -102,7 +130,7 @@ def global_search(
                 Branch.name.ilike(query_term),
                 Branch.code.ilike(query_term),
                 Branch.city.ilike(query_term),
-            )
+            ),
         ).limit(5)
     ).all()
     for b in branches:
@@ -113,16 +141,33 @@ def global_search(
             "page": "Branches",
         })
 
-    # 5. Documents
-    docs = db.scalars(
-        select(Document).where(
-            Document.organization_id == org_id,
-            or_(
-                Document.title.ilike(query_term),
-                Document.category.ilike(query_term),
-            )
-        ).limit(5)
-    ).all()
+    # 5. Documents (RBAC filtered)
+    doc_query = select(Document).where(
+        Document.organization_id == org_id,
+        or_(
+            Document.title.ilike(query_term),
+            Document.category.ilike(query_term),
+        ),
+    )
+    if role_name == "EMPLOYEE":
+        if own_emp:
+            doc_query = doc_query.where(Document.employee_id == own_emp.id)
+        else:
+            doc_query = doc_query.where(Document.id == None)
+    elif role_name == "MANAGER":
+        if own_emp:
+            direct_report_ids = db.scalars(
+                select(Employee.id).where(
+                    Employee.organization_id == org_id,
+                    Employee.reporting_manager_id == own_emp.id,
+                )
+            ).all()
+            allowed_ids = set(direct_report_ids) | {own_emp.id}
+            doc_query = doc_query.where(Document.employee_id.in_(allowed_ids))
+        else:
+            doc_query = doc_query.where(Document.id == None)
+
+    docs = db.scalars(doc_query.limit(5)).all()
     for doc in docs:
         results["documents"].append({
             "id": str(doc.id),
@@ -131,14 +176,14 @@ def global_search(
             "page": "Documents",
         })
 
-    # 6. Announcements
+    # 6. Announcements (Visible to all in org)
     announcements = db.scalars(
         select(Announcement).where(
             Announcement.organization_id == org_id,
             or_(
                 Announcement.title.ilike(query_term),
                 Announcement.content.ilike(query_term),
-            )
+            ),
         ).limit(5)
     ).all()
     for a in announcements:
@@ -149,24 +194,25 @@ def global_search(
             "page": "Announcements",
         })
 
-    # 7. Candidates
-    candidates = db.scalars(
-        select(Candidate).where(
-            Candidate.organization_id == org_id,
-            or_(
-                Candidate.first_name.ilike(query_term),
-                Candidate.last_name.ilike(query_term),
-                Candidate.email.ilike(query_term),
-            )
-        ).limit(5)
-    ).all()
-    for c in candidates:
-        results["candidates"].append({
-            "id": str(c.id),
-            "title": f"{c.first_name} {c.last_name}",
-            "subtitle": f"Candidate · {c.email} · Status: {c.status}",
-            "page": "Recruitment",
-        })
+    # 7. Candidates (Hidden from standard employees)
+    if role_name in ["HR", "HR_MANAGER", "ORG_ADMIN", "SUPER_ADMIN"]:
+        candidates = db.scalars(
+            select(Candidate).where(
+                Candidate.organization_id == org_id,
+                or_(
+                    Candidate.first_name.ilike(query_term),
+                    Candidate.last_name.ilike(query_term),
+                    Candidate.email.ilike(query_term),
+                ),
+            ).limit(5)
+        ).all()
+        for c in candidates:
+            results["candidates"].append({
+                "id": str(c.id),
+                "title": f"{c.first_name} {c.last_name or ''}".strip(),
+                "subtitle": f"Candidate · {c.email} · Stage: {c.stage}",
+                "page": "Recruitment",
+            })
 
     # Total counts
     total_found = sum(len(v) for v in results.values())
@@ -175,3 +221,4 @@ def global_search(
         "total_results": total_found,
         "results": results,
     }
+

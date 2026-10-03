@@ -65,3 +65,10 @@ require_employee = require_roles(
     "MANAGER",
     "EMPLOYEE",
 )
+
+
+def get_user_role_name(user: User, db: Session) -> str:
+    if getattr(user, "role", None) and user.role:
+        return user.role.name
+    role = db.scalar(select(Role).where(Role.id == user.role_id))
+    return role.name if role else "EMPLOYEE"

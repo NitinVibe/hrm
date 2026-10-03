@@ -142,6 +142,27 @@ def get_employee_balances(
     if not emp:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Employee not found.")
 
+    # Role-based access control
+    role_name = current_user.role.name.upper() if current_user.role else "EMPLOYEE"
+    if role_name == "EMPLOYEE":
+        if emp.user_id != current_user.id and emp.email != current_user.email:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You can only access your own leave balances.",
+            )
+    elif role_name == "MANAGER":
+        mgr_emp = db.scalar(
+            select(Employee).where(
+                Employee.organization_id == current_user.organization_id,
+                Employee.user_id == current_user.id,
+            )
+        )
+        if mgr_emp and emp.id != mgr_emp.id and emp.reporting_manager_id != mgr_emp.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You can only access leave balances for your direct reports or yourself.",
+            )
+
     balances = db.scalars(
         select(LeaveBalance).where(
             LeaveBalance.organization_id == current_user.organization_id,
@@ -205,6 +226,25 @@ def allocate_leave_balance(
     current_user: User = Depends(require_hr),
     db: Session = Depends(get_db),
 ):
+    # Verify employee and leave type belong to organization
+    emp = db.scalar(
+        select(Employee).where(
+            Employee.id == data.employee_id,
+            Employee.organization_id == current_user.organization_id,
+        )
+    )
+    if not emp:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Employee not found.")
+
+    lt = db.scalar(
+        select(LeaveType).where(
+            LeaveType.id == data.leave_type_id,
+            LeaveType.organization_id == current_user.organization_id,
+        )
+    )
+    if not lt:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Leave type not found.")
+
     bal = db.scalar(
         select(LeaveBalance).where(
             LeaveBalance.organization_id == current_user.organization_id,
@@ -215,7 +255,6 @@ def allocate_leave_balance(
     )
     if bal:
         bal.total_allocated = data.total_allocated
-        bal.available_days = data.total_allocated - bal.used_days
         bal.updated_at = datetime.utcnow()
     else:
         bal = LeaveBalance(
@@ -226,7 +265,6 @@ def allocate_leave_balance(
             total_allocated=data.total_allocated,
             used_days=0.0,
             pending_days=0.0,
-            available_days=data.total_allocated,
         )
         db.add(bal)
 

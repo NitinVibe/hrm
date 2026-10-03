@@ -53,9 +53,14 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
 
 
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+
 class MeResponse(BaseModel):
     id: str
     email: EmailStr
     role: str
     organization_id: str
+    employee_id: str | None = None
     employee_id: str | None = None

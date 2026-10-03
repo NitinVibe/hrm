@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, time
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
@@ -57,3 +57,32 @@ class AttendanceTodayStatusResponse(BaseModel):
     leave_reason: str | None = None
     state: str  # "NO_PROFILE", "NOT_CHECKED_IN", "CHECKED_IN", "LATE", "CHECKED_OUT", "ON_LEAVE"
     attendance: AttendanceTodayItem | None = None
+
+
+class AttendanceRegularizationCreate(BaseModel):
+    attendance_date: date
+    requested_check_in: time | None = None
+    requested_check_out: time | None = None
+    reason: str
+
+
+class AttendanceRegularizationReject(BaseModel):
+    rejection_reason: str | None = None
+
+
+class AttendanceRegularizationResponse(BaseModel):
+    id: UUID
+    organization_id: UUID
+    employee_id: UUID
+    attendance_date: date
+    requested_check_in: time | None = None
+    requested_check_out: time | None = None
+    reason: str
+    status: str
+    reviewed_by_id: UUID | None = None
+    reviewed_at: datetime | None = None
+    rejection_reason: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)

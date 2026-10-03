@@ -12,6 +12,29 @@ from app.schemas.audit_log import AuditLogResponse
 
 router = APIRouter(prefix="/audit-logs", tags=["Audit Logs"])
 
+def log_audit(
+    db: Session,
+    organization_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    action: str,
+    entity_type: str,
+    entity_id: str | None = None,
+    details: str | None = None,
+    ip_address: str | None = None,
+) -> AuditLog:
+    entry = AuditLog(
+        organization_id=organization_id,
+        user_id=user_id,
+        action=action.upper(),
+        entity_type=entity_type.lower(),
+        entity_id=entity_id,
+        details=details,
+        ip_address=ip_address,
+    )
+    db.add(entry)
+    db.flush()
+    return entry
+
 @router.get("", response_model=list[AuditLogResponse])
 def list_audit_logs(
     action: str | None = None,

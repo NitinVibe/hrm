@@ -1,10 +1,13 @@
 import uuid
+from datetime import datetime
 from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from jose import JWTError, jwt
+from app.core.config import settings
 from app.core.security import (
     create_access_token,
     create_refresh_token,
@@ -21,6 +24,7 @@ from app.schemas.auth import (
     RegisterRequest,
     RegisterResponse,
     TokenResponse,
+    RefreshTokenRequest,
     UserResponse,
 )
 from app.core.auth_dependencies import get_current_user
@@ -157,6 +161,9 @@ def login(
             detail="Invalid email/Employee ID or password.",
         )
 
+    user.last_login_at = datetime.utcnow()
+    db.commit()
+
     access_token = create_access_token(
         subject=str(user.id),
     )
@@ -169,6 +176,60 @@ def login(
         access_token=access_token,
         refresh_token=refresh_token,
     )
+
+@router.post(
+    "/refresh",
+    response_model=TokenResponse,
+)
+def refresh_token(
+    data: RefreshTokenRequest,
+    db: Session = Depends(get_db),
+):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate refresh token.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    try:
+        payload = jwt.decode(
+            data.refresh_token,
+            settings.jwt_secret,
+            algorithms=[settings.jwt_algorithm],
+        )
+        user_id = payload.get("sub")
+        token_type = payload.get("type")
+
+        if not user_id or token_type != "refresh":
+            raise credentials_exception
+
+        user_uuid = uuid.UUID(user_id)
+    except (JWTError, ValueError):
+        raise credentials_exception
+
+    user = db.scalar(select(User).where(User.id == user_uuid))
+    if not user:
+        raise credentials_exception
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User account is inactive.",
+        )
+
+    new_access_token = create_access_token(subject=str(user.id))
+    new_refresh_token = create_refresh_token(subject=str(user.id))
+
+    return TokenResponse(
+        access_token=new_access_token,
+        refresh_token=new_refresh_token,
+    )
+
+@router.post("/logout")
+def logout(
+    current_user: User = Depends(get_current_user),
+):
+    return {"message": "Logged out successfully."}
 
 @router.get("/me")
 def get_me(

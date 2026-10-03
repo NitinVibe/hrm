@@ -11,6 +11,7 @@ from app.models.announcement import Announcement
 from app.models.user import User
 from app.schemas.announcement import AnnouncementCreate, AnnouncementResponse
 from app.services.audit import log_audit
+from app.services.notifications import notify_all_org_employees
 
 router = APIRouter(prefix="/announcements", tags=["Announcements"])
 
@@ -54,6 +55,15 @@ def create_announcement(
         entity_type="announcement",
         entity_id=str(a.id),
         details={"title": a.title, "priority": a.priority},
+    )
+
+    notify_all_org_employees(
+        db,
+        organization_id=current_user.organization_id,
+        title=f"Announcement: {a.title}",
+        message=a.content[:160],
+        notification_type="announcement",
+        link="/announcements",
     )
 
     db.commit()
